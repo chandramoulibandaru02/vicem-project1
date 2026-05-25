@@ -1,100 +1,234 @@
 import logging
-from pathlib import Path
+import os
+from typing import Any
 
-import chromadb
-from chromadb.config import Settings
+from dotenv import load_dotenv
+from pinecone import Pinecone
+
+load_dotenv()
 
 
 class VectorStore:
-    def __init__(self, persist_directory: str = "chroma_db", logger: logging.Logger | None = None) -> None:
-        self.logger = logger or logging.getLogger("ecm_ai_backend")
-        self.persist_directory = Path(persist_directory)
-        self.persist_directory.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        index_name: str | None = None,
+        namespace: str = "default",
+        logger: logging.Logger | None = None,
+    ) -> None:
 
-        self.client = chromadb.PersistentClient(
-            path=str(self.persist_directory),
-            settings=Settings(anonymized_telemetry=False),
+        self.logger = logger or logging.getLogger(
+            "ecm_ai_backend"
         )
 
-    def create_collection(self, collection_name: str = "ecm_documents"):
+        self.api_key = os.getenv("PINECONE_API_KEY")
+
+        if not self.api_key:
+            raise ValueError(
+                "PINECONE_API_KEY not found"
+            )
+
+        self.index_name = (
+            index_name
+            or os.getenv("PINECONE_INDEX_NAME")
+            or "ecm-documents"
+        )
+
+        self.namespace = namespace
+
         try:
-            return self.client.get_collection(name=collection_name)
-        except Exception:
-            return self.client.create_collection(name=collection_name)
+            # Initialize Pinecone
+            self.pc = Pinecone(
+                api_key=self.api_key
+            )
+
+            # Connect to index
+            self.index = self.pc.Index(
+                self.index_name
+            )
+
+            self.logger.info(
+                "Connected to Pinecone index: %s",
+                self.index_name,
+            )
+
+        except Exception as e:
+            self.logger.exception(
+                f"Pinecone initialization failed: {str(e)}"
+            )
+            raise
 
     def add_documents(
         self,
-        collection_name: str,
         documents: list[str],
         embeddings: list[list[float]],
-        metadatas: list[dict[str, str | int | None]],
+        metadatas: list[
+            dict[str, str | int | float | bool | None]
+        ],
         ids: list[str],
     ) -> None:
-        collection = self.create_collection(collection_name)
 
-        collection.add(
-            documents=documents,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids,
-        )
+        if not (
+            len(documents)
+            == len(embeddings)
+            == len(metadatas)
+            == len(ids)
+        ):
+            raise ValueError(
+                "documents, embeddings, metadatas, ids length mismatch"
+            )
 
-        self.logger.info(
-            "Added %s documents to collection %s",
-            len(ids),
-            collection_name,
-        )
+        vectors = []
 
-    def search_documents(
-        self,
-        collection_name: str,
-        query_embedding: list[float],
-        top_k: int = 5,
-        filters: dict[str, str | int | bool | None] | None = None,
-    ) -> list[dict[str, object]]:
-        collection = self.create_collection(collection_name)
+        for i in range(len(ids)):
 
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            where=filters,
-        )
+            metadata = metadatas[i] or {}
 
-        formatted = []
-        for index in range(len(results["ids"][0])):
-            formatted.append(
+            metadata["text"] = documents[i]
+
+            vectors.append(
                 {
-                    "id": results["ids"][0][index],
-                    "document": results["documents"][0][index],
-                    "metadata": results["metadatas"][0][index],
-                    "distance": results["distances"][0][index],
+                    "id": ids[i],
+                    "values": embeddings[i],
+                    "metadata": metadata,
                 }
             )
 
-        self.logger.info(
-            "Search returned %s results for collection %s",
-            len(formatted),
-            collection_name,
-        )
-        return formatted
+        try:
+            self.index.upsert(
+                vectors=vectors,
+                namespace=self.namespace,
+            )
+
+            self.logger.info(
+                "Inserted %s vectors into Pinecone",
+                len(vectors),
+            )
+
+        except Exception as e:
+            self.logger.exception(
+                f"Vector upsert failed: {str(e)}"
+            )
+            raise
+
+    def search_documents(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, object]]:
+
+        try:
+            response = self.index.query(
+                vector=query_embedding,
+                top_k=top_k,
+                include_metadata=True,
+                namespace=self.namespace,
+                filter=filters,
+            )
+
+            formatted_results = []
+
+            for match in response.matches:
+
+                metadata = match.metadata or {}
+
+                formatted_results.append(
+                    {
+                        "id": match.id,
+                        "document": metadata.get(
+                            "text",
+                            "",
+                        ),
+                        "metadata": metadata,
+                        "score": match.score,
+                    }
+                )
+
+            self.logger.info(
+                "Retrieved %s results from Pinecone",
+                len(formatted_results),
+            )
+
+            return formatted_results
+
+        except Exception as e:
+            self.logger.exception(
+                f"Vector search failed: {str(e)}"
+            )
+            raise
+
+    def delete_documents(
+        self,
+        ids: list[str],
+    ) -> None:
+
+        try:
+            self.index.delete(
+                ids=ids,
+                namespace=self.namespace,
+            )
+
+            self.logger.info(
+                "Deleted %s vectors",
+                len(ids),
+            )
+
+        except Exception as e:
+            self.logger.exception(
+                f"Vector deletion failed: {str(e)}"
+            )
+            raise
+
+    def clear_namespace(self) -> None:
+
+        try:
+            self.index.delete(
+                delete_all=True,
+                namespace=self.namespace,
+            )
+
+            self.logger.info(
+                "Cleared namespace: %s",
+                self.namespace,
+            )
+
+        except Exception as e:
+            self.logger.exception(
+                f"Namespace cleanup failed: {str(e)}"
+            )
+            raise
 
 
-def create_vectorstore(persist_directory: str = "chroma_db", logger: logging.Logger | None = None) -> VectorStore:
-    logger = logger or logging.getLogger("ecm_ai_backend")
-    logger.info("Creating Chroma vector store at %s", persist_directory)
-    return VectorStore(persist_directory=persist_directory, logger=logger)
+def create_vectorstore(
+    logger: logging.Logger | None = None,
+    namespace: str = "default",
+) -> VectorStore:
+
+    logger = logger or logging.getLogger(
+        "ecm_ai_backend"
+    )
+
+    logger.info(
+        "Creating Pinecone vector store"
+    )
+
+    return VectorStore(
+        logger=logger,
+        namespace=namespace,
+    )
 
 
 def add_documents(
     vector_store: VectorStore,
-    collection_name: str,
     documents: list[str],
     embeddings: list[list[float]],
-    metadatas: list[dict[str, str | int | None]],
+    metadatas: list[
+        dict[str, str | int | float | bool | None]
+    ],
     ids: list[str],
 ) -> None:
+
     vector_store.add_documents(
-        collection_name=collection_name,
         documents=documents,
         embeddings=embeddings,
         metadatas=metadatas,
@@ -104,13 +238,12 @@ def add_documents(
 
 def search_documents(
     vector_store: VectorStore,
-    collection_name: str,
     query_embedding: list[float],
     top_k: int = 5,
-    filters: dict[str, str | int | bool | None] | None = None,
+    filters: dict[str, Any] | None = None,
 ) -> list[dict[str, object]]:
+
     return vector_store.search_documents(
-        collection_name=collection_name,
         query_embedding=query_embedding,
         top_k=top_k,
         filters=filters,
