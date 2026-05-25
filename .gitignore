@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+venv/
+
+# Uploads
+uploads/
+app/uploads/
+
+# Vector DB
+chroma_db/
+
+# VSCode
+.vscode/
+
+# Logs
+*.log
